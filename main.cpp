@@ -18,12 +18,15 @@ public:
   explicit th_pool_t(unsigned int k);
   ~th_pool_t();
   void submit(f_t f);
+  void wait();
 
 private:
   void execute();
   std::queue< f_t > tasks_;
   std::mutex mx_;
   std::condition_variable cd_;
+  std::condition_variable wait_cd_;
+  size_t counter = 0;
   bool stop_{false};
   std::vector< std::thread > ths_;
 };
@@ -35,13 +38,26 @@ int main()
   {
     pool.submit(task_t{});
   }
+  pool.wait();
 } // pool.~th_poop_t()
+
+void th_pool_t::wait()
+{
+  std::unique_lock< std::mutex > lck(mx_);
+  auto proceed = [&]()
+  {
+    return !counter;
+  };
+  wait_cd_.wait(lck, proceed);
+}
 
 void th_pool_t::submit(f_t f)
 {
-  mx_.lock();
-  tasks_.push(std::move(f));
-  mx_.unlock();
+  {
+    std::scoped_lock< std::mutex > lck(mx_);
+    tasks_.push(std::move(f));
+    ++counter;
+  }
   cd_.notify_one();
 }
 
@@ -59,9 +75,10 @@ th_pool_t::th_pool_t(unsigned int k)
 
 th_pool_t::~th_pool_t()
 {
-  mx_.lock();
-  stop_ = true;
-  mx_.unlock();
+  {
+    std::scoped_lock< std::mutex > lck(mx_);
+    stop_ = true;
+  }
   cd_.notify_all();
   for (auto&& th : ths_)
   {
@@ -78,7 +95,7 @@ void task_t::operator()()
 
 void th_pool_t::execute()
 {
-  std::unique_lock lck(mx_);
+  std::unique_lock< std::mutex > lck(mx_);
   do
   {
     auto proceed = [&]()
@@ -87,7 +104,9 @@ void th_pool_t::execute()
     };
     cd_.wait(lck, proceed);
     if (tasks_.empty())
+    {
       continue;
+    }
     auto task = std::move(tasks_.front());
     tasks_.pop();
     lck.unlock();
@@ -98,5 +117,10 @@ void th_pool_t::execute()
     catch (...)
     {}
     lck.lock();
-  } while (!stop_ || !tasks_.empty());
+    if (!--counter)
+    {
+      wait_cd_.notify_all();
+    }
+  }
+  while (!stop_ || !tasks_.empty());
 } // lck.~unique_lock() -> unlock()
